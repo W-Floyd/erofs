@@ -7,7 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 
-	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/W-Floyd/erofs/internal/ondisk"
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)

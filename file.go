@@ -5,7 +5,7 @@ import (
 	"io"
 	"io/fs"
 
-	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/W-Floyd/erofs/internal/ondisk"
 )
 
 // file implements fs.File, io.ReadSeeker, and io.ReaderAt for uncompressed files.

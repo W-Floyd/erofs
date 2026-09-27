@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/W-Floyd/erofs/internal/ondisk"
 )
 
 // DeviceInfo holds parsed information about an extra blob device.

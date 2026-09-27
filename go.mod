@@ -1,4 +1,4 @@
-module github.com/Xe/erofs
+module github.com/W-Floyd/erofs
 
 go 1.26.1
 

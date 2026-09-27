@@ -8,7 +8,7 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/W-Floyd/erofs/internal/ondisk"
 )
 
 // buildWithEpoch builds an image from fsys pinned to epoch and returns the bytes.

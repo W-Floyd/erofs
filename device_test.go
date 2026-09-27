@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Xe/erofs/internal/ondisk"
+	"github.com/W-Floyd/erofs/internal/ondisk"
 )
 
 func TestParseDeviceTable(t *testing.T) {

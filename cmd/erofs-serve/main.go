@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Xe/erofs"
+	"github.com/W-Floyd/erofs"
 	"github.com/spf13/pflag"
 )
 
