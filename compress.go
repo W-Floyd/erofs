@@ -126,6 +126,10 @@ func (cf *compressedFile) readAt(p []byte, off int64) (int, error) {
 		if err := cf.loadPCluster(off); err != nil {
 			return total, err
 		}
+		// The freshly loaded extent must cover off, or the loop would spin.
+		if !(off >= cf.cacheStart && off < cf.cacheEnd && cf.cacheData != nil) {
+			return total, fmt.Errorf("erofs: extent at off=%d did not cover it (cache [%d,%d))", off, cf.cacheStart, cf.cacheEnd)
+		}
 	}
 
 	if off >= int64(cf.ino.size) {
@@ -258,12 +262,22 @@ func (cf *compressedFile) loadPClusterFull(la int64) error {
 		}
 	}
 
+	return cf.decodeExtent(ltype, algID, pa, pclusterSize, extentStart, extentEnd, clusterOfs)
+}
+
+// decodeExtent reads the physical pcluster [pa, pa+pclusterSize), turns it into
+// the logical range [extentStart, extentEnd) — de-shifting a PLAIN extent or
+// decompressing a HEAD one — and caches the result. Shared by the full and
+// compact index paths, which differ only in how they resolve those parameters.
+func (cf *compressedFile) decodeExtent(ltype, algID uint8, pa, pclusterSize, extentStart, extentEnd, clusterOfs int64) error {
+	f := cf.fsys
+	blockSize := int64(f.blockSize)
+
 	decompSize := extentEnd - extentStart
 	if decompSize <= 0 {
 		decompSize = cf.lclustSz
 	}
 
-	// Read compressed data.
 	compressed := make([]byte, pclusterSize)
 	n, err := f.r.ReadAt(compressed, pa)
 	if err != nil && n == 0 {
@@ -271,7 +285,6 @@ func (cf *compressedFile) loadPClusterFull(la int64) error {
 	}
 	compressed = compressed[:n]
 
-	// Decompress.
 	decompressed := make([]byte, decompSize)
 
 	if ltype == ondisk.LClusterTypePlain {
@@ -330,196 +343,249 @@ func (cf *compressedFile) loadPClusterFull(la int64) error {
 
 // loadPClusterCompact handles the COMPACT index format (layout 3).
 // For now, fall back to reading the entries as if they were packed 4-byte entries.
+// loadPClusterCompact handles the COMPACT (compacted 2B/4B) index format. It
+// resolves the lcluster covering la to its head, sizes the pcluster and extent
+// exactly as loadPClusterFull does, then hands off to decodeExtent. The index
+// decode itself is loadCompactLcluster, a port of the kernel's
+// z_erofs_load_compact_lcluster (fs/erofs/zmap.c).
 func (cf *compressedFile) loadPClusterCompact(la int64) error {
-	// The compact format is complex (bit-packed). For an initial implementation,
-	// we attempt a simplified approach: read from the compacted index.
 	ino := cf.ino
-	f := cf.fsys
-	blockSize := int64(f.blockSize)
-
-	// ebase = ALIGN(metaEnd, 8) + 8 (map header)
-	ebase := align(ino.metaEnd(), 8) + 8
-
-	lcn := la / cf.lclustSz
+	blockSize := int64(cf.fsys.blockSize)
 	totalLclusters := (int64(ino.size) + cf.lclustSz - 1) / cf.lclustSz
 
-	// Compute compacted_4b_initial.
-	compacted4bInit := int64((32 - ebase%32) / 4 & 7)
-
-	// Determine which region this lcn falls in.
-	var entryOff int64
-	var packSize int64
-
-	if lcn < compacted4bInit {
-		// 4-byte region (initial).
-		// Each pack of 2 lclusters = 12 bytes (2*4 + 4 for base blkaddr).
-		packIdx := lcn / 2
-		inPack := lcn % 2
-		entryOff = ebase + packIdx*12
-		packSize = 12
-		return cf.decodeCompactPack(entryOff, packSize, 2, int(inPack), la, totalLclusters, blockSize)
+	lcn := la / cf.lclustSz
+	endoff := la % cf.lclustSz
+	m, err := cf.loadCompactLcluster(lcn, totalLclusters)
+	if err != nil {
+		return err
 	}
 
-	rem := lcn - compacted4bInit
-
-	// Check for 2-byte region.
-	compacted2b := int64(0)
-	if cf.mapHeader.Advise&ondisk.AdviseCompacted2B != 0 && compacted4bInit < totalLclusters {
-		compacted2b = ((totalLclusters - compacted4bInit) / 16) * 16
+	// Resolve the extent's head lcluster, mirroring z_erofs_map_blocks_fo: this
+	// lcluster is the head only if it is a HEAD/PLAIN whose data (at clusterofs)
+	// starts at or before the wanted offset; otherwise la belongs to an earlier
+	// extent and we walk back (z_erofs_extent_lookback) to its head. A HEAD/PLAIN
+	// whose data starts past endoff is a mid-lcluster boundary — la is the prior
+	// extent's tail, one lcluster back.
+	headLcn := lcn
+	if m.typ == ondisk.LClusterTypeNonHead || endoff < m.clusterofs {
+		dist := m.delta0
+		if m.typ != ondisk.LClusterTypeNonHead {
+			if lcn == 0 {
+				return fmt.Errorf("erofs: compact head at lcn 0 with clusterofs > offset")
+			}
+			dist = 1
+		}
+		for {
+			if dist == 0 {
+				return fmt.Errorf("erofs: zero lookback distance at lcn=%d", headLcn)
+			}
+			headLcn -= dist
+			if headLcn < 0 {
+				return fmt.Errorf("erofs: compact lookback went negative from lcn=%d", lcn)
+			}
+			if m, err = cf.loadCompactLcluster(headLcn, totalLclusters); err != nil {
+				return err
+			}
+			if m.typ == ondisk.LClusterTypeNonHead {
+				dist = m.delta0
+				continue
+			}
+			break
+		}
 	}
 
-	afterInit := ebase + ((compacted4bInit+1)/2)*12
-	if compacted4bInit%2 != 0 {
-		afterInit = ebase + (compacted4bInit/2)*12 + 12
+	ltype := m.typ
+	var algID uint8
+	switch ltype {
+	case ondisk.LClusterTypePlain:
+		algID = 0xFF
+	case ondisk.LClusterTypeHead1:
+		algID = cf.mapHeader.HeadAlgorithm()
+	case ondisk.LClusterTypeHead2:
+		algID = cf.mapHeader.Head2Algorithm()
+	default:
+		return fmt.Errorf("erofs: unexpected compact lcluster type %d", ltype)
 	}
 
-	if rem < compacted2b {
-		// 2-byte region.
-		packIdx := rem / 16
-		inPack := int(rem % 16)
-		packOff := afterInit + packIdx*36 // 16*2 + 4 = 36 bytes per pack
-		return cf.decodeCompactPack(packOff, 36, 16, inPack, la, totalLclusters, blockSize)
+	pblk := m.pblk
+	clusterOfs := m.clusterofs
+
+	// pcluster block count: for a big pcluster the first following NONHEAD
+	// carries the compressed block count (D0_CBLKCNT); otherwise it is one block.
+	pclusterBlocks := int64(1)
+	if headLcn+1 < totalLclusters {
+		if nx, err := cf.loadCompactLcluster(headLcn+1, totalLclusters); err == nil &&
+			nx.typ == ondisk.LClusterTypeNonHead && nx.compressedblks > 0 {
+			pclusterBlocks = nx.compressedblks
+		}
 	}
 
-	// Remaining 4-byte region.
-	rem2 := rem - compacted2b
-	afterCompact2b := afterInit + (compacted2b/16)*36
-	packIdx := rem2 / 2
-	inPack := int(rem2 % 2)
-	entryOff = afterCompact2b + packIdx*12
-	packSize = 12
-	return cf.decodeCompactPack(entryOff, packSize, 2, inPack, la, totalLclusters, blockSize)
+	pa := pblk * blockSize
+	pclusterSize := pclusterBlocks * blockSize
+
+	// Extent boundaries: forward-scan for the next non-NONHEAD.
+	extentStart := headLcn*cf.lclustSz + clusterOfs
+	extentEnd := int64(ino.size)
+	for scanLcn := headLcn + 1; scanLcn < totalLclusters; scanLcn++ {
+		sm, err := cf.loadCompactLcluster(scanLcn, totalLclusters)
+		if err != nil {
+			break
+		}
+		if sm.typ != ondisk.LClusterTypeNonHead {
+			extentEnd = scanLcn*cf.lclustSz + sm.clusterofs
+			break
+		}
+	}
+
+	return cf.decodeExtent(ltype, algID, pa, pclusterSize, extentStart, extentEnd, clusterOfs)
 }
 
-// decodeCompactPack decodes a compact index pack and loads the pcluster.
-func (cf *compressedFile) decodeCompactPack(packOff, packSize int64, vcnt, idx int, la, totalLclusters, blockSize int64) error {
-	ino := cf.ino
-	f := cf.fsys
+// compactLcluster is one decoded compacted-index entry — the fields the kernel's
+// z_erofs_maprecorder exposes, normalized to bytes.
+type compactLcluster struct {
+	typ            uint8
+	clusterofs     int64
+	pblk           int64 // physical block address (HEAD / PLAIN)
+	delta0         int64 // backward distance to the head (NONHEAD)
+	compressedblks int64 // pcluster block count, set on the first NONHEAD of a big pcluster
+}
 
-	pack := make([]byte, packSize)
-	if _, err := f.r.ReadAt(pack, packOff); err != nil {
-		return fmt.Errorf("erofs: reading compact pack: %w", err)
+// loadCompactLcluster decodes the compacted index entry for lcn — a faithful
+// port of the kernel's z_erofs_load_compact_lcluster + unpack_compacted_index
+// (fs/erofs/zmap.c). Lookahead (delta[1]) is omitted: the reader never needs it.
+func (cf *compressedFile) loadCompactLcluster(lcn, totalidx int64) (compactLcluster, error) {
+	var m compactLcluster
+	f := cf.fsys
+	lclusterbits := int(f.blockSzBits) + int(cf.mapHeader.LClusterBits())
+	if lcn >= totalidx || lclusterbits > 14 {
+		return m, fmt.Errorf("erofs: compact lcn %d out of range", lcn)
 	}
 
-	// Last 4 bytes are the base block address.
-	baseBlkAddr := int64(le32(pack[len(pack)-4:]))
+	// ebase = Z_EROFS_MAP_HEADER_END = ALIGN(metaEnd, 8) + map header (8 bytes).
+	ebase := align(cf.ino.metaEnd(), 8) + 8
+	compacted4bInitial := ((32 - ebase%32) / 4) & 7
+	var compacted2b int64
+	if cf.mapHeader.Advise&ondisk.AdviseCompacted2B != 0 && compacted4bInitial < totalidx {
+		compacted2b = ((totalidx - compacted4bInitial) / 16) * 16
+	}
 
-	// Decode the entry at index idx.
-	lclusterBits := int(cf.mapHeader.LClusterBits()) + int(f.blockSzBits)
-	lobits := lclusterBits
-	if lobits < 12 {
+	pos := ebase
+	amortizedshift := int64(2) // compact_4b
+	rel := lcn
+	if rel >= compacted4bInitial {
+		pos += compacted4bInitial * 4
+		rel -= compacted4bInitial
+		if rel < compacted2b {
+			amortizedshift = 1
+		} else {
+			pos += compacted2b * 2
+			rel -= compacted2b
+		}
+	}
+	pos += rel * (1 << amortizedshift)
+
+	// lclusters per pack.
+	var vcnt int64
+	switch {
+	case (1<<amortizedshift) == 4 && lclusterbits <= 14:
+		vcnt = 2
+	case (1<<amortizedshift) == 2 && lclusterbits <= 12:
+		vcnt = 16
+	default:
+		return m, fmt.Errorf("erofs: unsupported compact packing (shift=%d bits=%d)", amortizedshift, lclusterbits)
+	}
+
+	packLen := vcnt << amortizedshift
+	lobits := lclusterbits
+	if lobits < 12 { // ilog2(LID0CBlkCnt)+1 == 12
 		lobits = 12
 	}
+	encodebits := int((packLen - 4) * 8 / vcnt)
 
-	var amortized int
-	if vcnt == 2 {
-		amortized = 4
+	packStart := pos &^ (packLen - 1)
+	pack := make([]byte, packLen)
+	if _, err := f.r.ReadAt(pack, packStart); err != nil {
+		return m, fmt.Errorf("erofs: reading compact pack: %w", err)
+	}
+	i := int((pos - packStart) >> amortizedshift)
+	bigPcluster := cf.mapHeader.Advise&ondisk.AdviseBigPCluster1 != 0
+
+	lo, typ := decodeCompactedBits(lobits, pack, encodebits*i)
+	m.typ = typ
+	if typ == ondisk.LClusterTypeNonHead {
+		m.clusterofs = int64(1) << lclusterbits
+		if lo&ondisk.LID0CBlkCnt != 0 {
+			if !bigPcluster {
+				return m, fmt.Errorf("erofs: D0_CBLKCNT set without big pcluster")
+			}
+			m.compressedblks = int64(lo &^ uint32(ondisk.LID0CBlkCnt))
+			m.delta0 = 1
+			return m, nil
+		}
+		if i+1 != int(vcnt) {
+			m.delta0 = int64(lo)
+			return m, nil
+		}
+		// The last lcluster in a pack stores delta[1]; recover delta[0] from the
+		// previous entry.
+		lo2, t2 := decodeCompactedBits(lobits, pack, encodebits*(i-1))
+		switch {
+		case t2 != ondisk.LClusterTypeNonHead:
+			lo2 = 0
+		case lo2&ondisk.LID0CBlkCnt != 0:
+			lo2 = 1
+		}
+		m.delta0 = int64(lo2) + 1
+		return m, nil
+	}
+
+	m.clusterofs = int64(lo)
+
+	// Physical block: the pack's trailing base blkaddr plus the HEAD blocks
+	// accumulated backward through the pack.
+	var nblk int64
+	if !bigPcluster {
+		nblk = 1
+		for i > 0 {
+			i--
+			l, t := decodeCompactedBits(lobits, pack, encodebits*i)
+			if t == ondisk.LClusterTypeNonHead {
+				i -= int(l)
+			}
+			if i >= 0 {
+				nblk++
+			}
+		}
 	} else {
-		amortized = 2
-	}
-	encodeBits := ((vcnt * amortized) - 4) * 8 / vcnt
-
-	bitPos := idx * encodeBits
-	bytePos := bitPos / 8
-	bitOff := uint(bitPos % 8)
-
-	// Read 4 bytes starting at bytePos.
-	if bytePos+4 > len(pack)-4 { // don't read into base blkaddr
-		bytePos = len(pack) - 8
-		if bytePos < 0 {
-			bytePos = 0
-		}
-	}
-	raw := le32(pack[bytePos:])
-	value := raw >> bitOff
-
-	lo := int64(value) & ((1 << lobits) - 1)
-	ltype := uint8((value >> lobits) & 3)
-
-	_ = lo // delta or offset depending on type
-
-	// For HEAD types, compute block address.
-	// The base blkaddr is for the last entry in the pack.
-	// HEAD entries accumulate backwards from the base.
-	if ltype == ondisk.LClusterTypeHead1 || ltype == ondisk.LClusterTypeHead2 || ltype == ondisk.LClusterTypePlain {
-		// Simplified: use baseBlkAddr for this entry.
-		// A full implementation would sum up block offsets backwards.
-		pblk := baseBlkAddr
-		pa := pblk * blockSize
-
-		lcn := la / cf.lclustSz
-		extentStart := lcn * cf.lclustSz
-		extentEnd := extentStart + cf.lclustSz
-		if extentEnd > int64(ino.size) {
-			extentEnd = int64(ino.size)
-		}
-
-		decompSize := extentEnd - extentStart
-		pclusterSize := blockSize // default 1 block
-
-		compressed := make([]byte, pclusterSize)
-		n, err := f.r.ReadAt(compressed, pa)
-		if err != nil && n == 0 {
-			return fmt.Errorf("erofs: reading compact pcluster: %w", err)
-		}
-		compressed = compressed[:n]
-
-		decompressed := make([]byte, decompSize)
-
-		if ltype == ondisk.LClusterTypePlain {
-			interlaced := cf.mapHeader.Advise&ondisk.AdviseInterlacedPCluster != 0
-			if interlaced {
-				pageofs := int(lo) % int(blockSize)
-				if pageofs > 0 {
-					tailLen := int(blockSize) - pageofs
-					copy(decompressed, compressed[len(compressed)-tailLen:])
-					copy(decompressed[tailLen:], compressed[:len(compressed)-tailLen])
-				} else {
-					copy(decompressed, compressed)
+		for i > 0 {
+			i--
+			l, t := decodeCompactedBits(lobits, pack, encodebits*i)
+			if t == ondisk.LClusterTypeNonHead {
+				if l&ondisk.LID0CBlkCnt != 0 {
+					i--
+					nblk += int64(l &^ uint32(ondisk.LID0CBlkCnt))
+					continue
 				}
-			} else {
-				copy(decompressed, compressed[lo:])
+				if l <= 1 {
+					return m, fmt.Errorf("erofs: corrupt big-pcluster delta %d", l)
+				}
+				i -= int(l) - 2
+				continue
 			}
-		} else {
-			var algID uint8
-			if ltype == ondisk.LClusterTypeHead1 {
-				algID = cf.mapHeader.HeadAlgorithm()
-			} else {
-				algID = cf.mapHeader.Head2Algorithm()
-			}
-
-			switch algID {
-			case ondisk.CompressionLZ4:
-				dn, err := lz4Decompress(compressed, decompressed)
-				if err != nil {
-					return fmt.Errorf("erofs: lz4 decompress (compact): %w", err)
-				}
-				decompressed = decompressed[:dn]
-			case ondisk.CompressionDeflate:
-				dn, err := deflateDecompress(compressed, decompressed)
-				if err != nil {
-					return fmt.Errorf("erofs: deflate decompress (compact): %w", err)
-				}
-				decompressed = decompressed[:dn]
-			case ondisk.CompressionZstd:
-				dn, err := zstdDecompress(compressed, decompressed)
-				if err != nil {
-					return fmt.Errorf("erofs: zstd decompress (compact): %w", err)
-				}
-				decompressed = decompressed[:dn]
-			default:
-				return fmt.Errorf("erofs: unsupported compression algorithm %d", algID)
-			}
+			nblk++
 		}
-
-		cf.cacheStart = extentStart
-		cf.cacheEnd = extentStart + int64(len(decompressed))
-		cf.cacheData = decompressed
-		return nil
 	}
+	m.pblk = int64(le32(pack[packLen-4:])) + nblk
+	return m, nil
+}
 
-	// NONHEAD: need to walk back to find HEAD. Use the FULL index fallback.
-	return fmt.Errorf("erofs: compact NONHEAD resolution not yet implemented for lcn=%d", la/cf.lclustSz)
+// decodeCompactedBits reads the lo-bits value and 2-bit type at bit offset
+// posBits within a compacted pack (kernel decode_compactedbits).
+func decodeCompactedBits(lobits int, pack []byte, posBits int) (lo uint32, typ uint8) {
+	v := le32(pack[posBits/8:]) >> uint(posBits%8)
+	lo = v & ((1 << lobits) - 1)
+	typ = uint8((v >> lobits) & 3)
+	return lo, typ
 }
 
 // readLClusterEntry reads a single lcluster index entry in FULL format.
