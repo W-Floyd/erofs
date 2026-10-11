@@ -604,13 +604,24 @@ func (cf *compressedFile) readLClusterEntry(indexStart, lcn int64) (ondisk.LClus
 
 // lz4Decompress decompresses LZ4 block data.
 func lz4Decompress(src, dst []byte) (int, error) {
-	// Trim trailing zeros if present (ZERO_PADDING feature).
+	// A stream's last sequence is raw literals, so it may legitimately end in
+	// zero bytes, indistinguishable from ZERO_PADDING after it. Decode as given
+	// first, then with the padding stripped, then with the zeros given back one
+	// at a time until the output fills dst.
+	if n, err := lz4.UncompressBlock(src, dst); err == nil {
+		return n, nil
+	}
 	trimmed := src
 	for len(trimmed) > 0 && trimmed[len(trimmed)-1] == 0 {
 		trimmed = trimmed[:len(trimmed)-1]
 	}
 	if len(trimmed) == 0 {
 		return 0, nil
+	}
+	for end := len(trimmed) + 1; end < len(src); end++ {
+		if n, err := lz4.UncompressBlock(src[:end], dst); err == nil && n == len(dst) {
+			return n, nil
+		}
 	}
 
 	n, err := lz4.UncompressBlock(trimmed, dst)
