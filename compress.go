@@ -299,8 +299,10 @@ func (cf *compressedFile) decodeExtent(ltype, algID uint8, pa, pclusterSize, ext
 				copy(decompressed, compressed)
 			}
 		} else {
-			// SHIFTED: skip clusterOfs bytes.
-			copy(decompressed, compressed[clusterOfs:])
+			// Without the interlaced advise, a plain pcluster stores its bytes
+			// from the start of the pcluster; clusterOfs only says where they
+			// land in the file.
+			copy(decompressed, compressed)
 		}
 	} else {
 		// EROFS 0-padding: the compressed stream is right-aligned within its
